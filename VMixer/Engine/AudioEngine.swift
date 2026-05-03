@@ -276,7 +276,7 @@ final class AudioEngine: ObservableObject {
         guard tapID != kAudioObjectUnknown, tapID != 0 else { return }
 
         // NEW: Apply the Software Pre-Amp if the tap was forced into a quiet Mixdown
-        let control = RealtimeControl(volumeCompensation: tapResult.requiresVolumeBoost ? 2.0 : 1.0)
+        let control = RealtimeControl(volumeCompensation: tapResult.volumeCompensation)
         
         guard let aggregateDeviceID = createAggregateDevice(tapID: tapID) else {
             _ = AudioHardwareDestroyProcessTap(tapID)
@@ -302,7 +302,7 @@ final class AudioEngine: ObservableObject {
     }
 
     // MARK: - CoreAudio Integration
-    private func createTapWithFallback(pid: Int32, bundleID: String?) -> (tapID: AudioObjectID, requiresVolumeBoost: Bool)? {
+    private func createTapWithFallback(pid: Int32, bundleID: String?) -> (tapID: AudioObjectID, volumeCompensation: Float)? {
         
         if let bundleID, !bundleID.isEmpty {
             var bundleTapID: AudioObjectID = 0
@@ -310,28 +310,32 @@ final class AudioEngine: ObservableObject {
             bundleDescription.uuid = UUID()
             
             var bundlesToTap = [bundleID]
+            var compensation: Float = 1.0
             switch bundleID {
             case "com.apple.Safari", "com.apple.SafariTechnologyPreview":
                 bundlesToTap.append("com.apple.WebKit.WebContent")
                 bundlesToTap.append("com.apple.WebKit.GPU")
+                compensation = 1.25
+                
             case "com.google.Chrome", "com.brave.Browser", "com.microsoft.edgemac", "com.vivaldi.Vivaldi":
                 bundlesToTap.append("\(bundleID).helper")
                 bundlesToTap.append("\(bundleID).helper.renderer")
                 bundlesToTap.append("\(bundleID).helper.plugin")
+                compensation = 2.0
+                
             case "org.mozilla.firefox":
                 bundlesToTap.append("org.mozilla.plugincontainer")
+                compensation = 2.0
                 
             case "com.apple.FaceTime":
-                // 🛑 FACETIME OVERWRITE FIX:
-                // Only tap the background daemon. Tapping the UI app causes audio issues.
                 bundlesToTap = ["com.apple.avconferenced"]
+                bundlesToTap.append("com.apple.telephonyutilities.callservicesd")
+                compensation = 3.0
                 
             default: break
             }
             
-            // 🛑 MIXDOWN ATTENUATION FIX:
-            // CoreAudio drops volume by 50% if isMixdown is true.
-            // If we only have 1 bundle (like FaceTime), we set this to false to get 100% volume.
+           
             let needsMixdown = bundlesToTap.count > 1
             
             bundleDescription.bundleIDs = bundlesToTap
@@ -344,7 +348,7 @@ final class AudioEngine: ObservableObject {
             if AudioHardwareCreateProcessTap(bundleDescription, &bundleTapID) == noErr {
                 let recoveredTapID = normalizedTapID(bundleTapID, fallbackUID: bundleDescription.uuid.uuidString, expectedName: bundleDescription.name)
                 if recoveredTapID != kAudioObjectUnknown, recoveredTapID != 0 {
-                    return (recoveredTapID, needsMixdown)
+                    return (recoveredTapID, needsMixdown ? compensation:1.0)
                 }
                 statusMessage = "Tap was created but UID lookup failed."
                 return nil
@@ -363,7 +367,7 @@ final class AudioEngine: ObservableObject {
                 let recoveredTapID = normalizedTapID(pidTapID, fallbackUID: pidDescription.uuid.uuidString, expectedName: pidDescription.name)
                 if recoveredTapID != kAudioObjectUnknown, recoveredTapID != 0 {
                     // Tap by PID forces a stereoMixdown, so it requires the volume boost
-                    return (recoveredTapID, true)
+                    return (recoveredTapID, 2.0)
                 }
                 return nil
             }
