@@ -1,7 +1,7 @@
 # VMixer 
 > **A streamlined volume mixer and audio control interface.**
 
-[![GitHub license](https://img.shields.io/github/license/rabraham360/vmixer)](https://github.com/rabraham360/vmixer/blob/main/LICENSE)
+[![GitHub license](https://img.shields.io/github/license/rabraham360/vmixer)](/LICENSE)
 [![GitHub release](https://img.shields.io/github/v/release/rabraham360/vmixer)](https://github.com/rabraham360/vmixer/releases)
 
 **VMixer** is a lightweight application designed to give users granular control over their system's audio streams. Built as a portfolio project, it focuses on clean UI/UX and efficient management of system audio APIs to allow per-application volume scaling.
@@ -39,6 +39,6 @@ brew install --cask vmixer
 - The Solution: Implemented [e.g., threading/asynchronous loops] to ensure the UI remains responsive even when multiple audio sources are being polled simultaneously.
 
 ### License
-This project is licensed under the MIT License - see the [LICENSE](github.com/rabraham30/vmixer/blob/main/LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](/LICENSE) file for details.
 
-Created by Rohan Abraham Check out my other projects on [GitHub](github.com/rabraham360)
+Created by Rohan Abraham Check out my other projects on [GitHub](https://github.com/rabraham360)
