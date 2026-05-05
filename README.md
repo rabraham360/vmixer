@@ -34,7 +34,6 @@ brew install --cask vmixer
 ```
 
 ## Challenges & Learnings
-- This section is vital for your portfolio!
 - The Challenge: Handling real-time audio stream updates without causing interface lag.
 - The Solution: Implemented [e.g., threading/asynchronous loops] to ensure the UI remains responsive even when multiple audio sources are being polled simultaneously.
 
