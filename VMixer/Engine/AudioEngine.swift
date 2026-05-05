@@ -221,7 +221,8 @@ final class AudioEngine: ObservableObject {
     }
 
     private func setupAutoHookingObserver() {
-        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didActivateApplicationNotification)
+        let workspace = NSWorkspace.shared
+        workspace.notificationCenter.publisher(for: NSWorkspace.didActivateApplicationNotification)
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
                 guard let self = self,
@@ -245,6 +246,23 @@ final class AudioEngine: ObservableObject {
                     bundleID: app.bundleIdentifier
                 )
                 self.addTarget(app: runningApp)
+            }
+            .store(in: &cancellables)
+        workspace.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self = self,
+                      let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+                
+                let pid = app.processIdentifier
+                
+                // If the closed app has a slider, completely remove it and destroy the audio tap
+                if self.targets.contains(where: { $0.pid == pid }) {
+                    self.removeTarget(pid: pid)
+                }
+                
+                // Keep your running apps list up-to-date in the background
+                self.refreshRunningApps()
             }
             .store(in: &cancellables)
     }
@@ -294,13 +312,12 @@ final class AudioEngine: ObservableObject {
         if let bundleID = bundleID {
             switch bundleID {
             case "com.apple.FaceTime":
-                compensation = 20   // 3x boost for FaceTime
             case "com.spotify.client":
-                compensation = 1.5   // Example: 1.5x boost for Spotify
+                compensation = 1.5
             case "com.apple.Safari", "com.google.Chrome":
-                compensation = 1.25   // Example: Lower browser volume to 80%
+                compensation = 1.25
             default:
-                compensation = 1.0   // Normal volume for everything else
+                compensation = 1.0
             }
         }
         let control = RealtimeControl(volumeCompensation: compensation)
