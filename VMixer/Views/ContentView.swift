@@ -12,8 +12,23 @@ struct ContentView: View {
     @Environment(\.openSettings) private var openSettings
     @AppStorage("showDebugStatus") private var showDebugStatus = false
     
+    // MARK: - Window Sizing
+    let maxWindowHeight: CGFloat = 600
+    let baseHeight: CGFloat = 135
+    let rowHeight: CGFloat = 100
+    let emptyStateHeight: CGFloat = 150
+    
+    var dynamicHeight: CGFloat {
+        if engine.targets.isEmpty {
+            return baseHeight + emptyStateHeight
+        }
+        let contentHeight = baseHeight + (CGFloat(engine.targets.count) * rowHeight) + 24
+        return min(contentHeight, maxWindowHeight)
+    }
+    
     var body: some View {
         VStack(spacing: 0) {
+            
             // MARK: - Header
             HStack {
                 Text("VMixer")
@@ -35,6 +50,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .focusable(false)
+                .onHover { if $0 { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
 
                 Spacer().frame(width: 12)
 
@@ -42,15 +58,17 @@ struct ContentView: View {
                     NSApplication.shared.terminate(nil)
                 }
                 .buttonStyle(.plain)
-                .foregroundColor(.secondary)
                 .focusable(false)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .onHover { if $0 { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
             }
             .padding()
             .background(Color(NSColor.windowBackgroundColor))
             
             Divider()
 
-            // MARK: - Master Volume (Controls System Output)
+            // MARK: - Master Volume Controls
             VStack(spacing: 12) {
                 HStack(spacing: 12) {
                     Button(action: {
@@ -101,7 +119,23 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            
+            // MARK: - Status Bar
+            if showDebugStatus {
+                Divider()
+                HStack {
+                    Text(engine.statusMessage)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                    Spacer()
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+                .background(Color(NSColor.windowBackgroundColor))
+            }
         }
-        .frame(width: 340, height: 600)
+        .frame(width: 340, height: dynamicHeight)
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: engine.targets.count)
     }
 }

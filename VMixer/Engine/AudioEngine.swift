@@ -18,7 +18,7 @@ import os
 @MainActor
 final class AudioEngine: ObservableObject {
     
-    // Uses os_unfair_lock to prevent priority inversion audio dropouts
+    // MARK: - Realtime Control
     private final class RealtimeControl {
         private var lock = os_unfair_lock_s()
         private var _volume: Float = 1.0
@@ -26,7 +26,6 @@ final class AudioEngine: ObservableObject {
         private var _lastFrameCount: UInt64 = 0
         private var _currentLevel: Float = 0.0
         
-        // NEW: Automatically boosts quiet mixdown taps back to 100%
         let volumeCompensation: Float
         
         init(volumeCompensation: Float = 1.0) {
@@ -70,10 +69,12 @@ final class AudioEngine: ObservableObject {
         }
     }
 
+    // MARK: - Models
     struct Target: Identifiable {
         let id: Int32
         let pid: Int32
         var displayName: String
+        let bundleID: String?
         var tapID: AudioObjectID
         var aggregateDeviceID: AudioObjectID
         var ioProcID: AudioDeviceIOProcID?
@@ -90,125 +91,110 @@ final class AudioEngine: ObservableObject {
 
         var id: Int32 { pid }
         var title: String {
-            if let bundleID, !bundleID.isEmpty { return "\(name) (\(bundleID))" }
+            if let bundleID, !bundleID.isEmpty {
+                return "\(name) (\(bundleID))"
+            }
             return name
         }
     }
 
+    // MARK: - Published State
     @Published private(set) var targets: [Target] = []
     @Published private(set) var runningApps: [RunningApp] = []
     @Published var statusMessage = "Ready"
     
-    private var controlsByPID: [Int32: RealtimeControl] = [:]
-    private var cancellables = Set<AnyCancellable>()
-    private var meterTimer: Timer?
-    
-    // MARK: - Linked Master Volume Controls
-    private var isSyncingInternally = false
-    private var preMuteVolume: Float = 0.5
-    private var currentListeningDeviceID: AudioObjectID = 0
-    
     @Published var masterVolume: Float = 1.0 {
         didSet {
-            guard !isSyncingInternally else { return }
-            isSyncingInternally = true
-            syncSystemVolume(to: masterVolume)
-            
-            if masterVolume <= 0.001 && !isMasterMuted {
-                isMasterMuted = true
-                syncSystemMute(muted: true)
-            } else if masterVolume > 0.001 && isMasterMuted {
-                isMasterMuted = false
-                syncSystemMute(muted: false)
-            }
-            isSyncingInternally = false
+            if !isSyncingHardware { setSystemVolume(to: masterVolume) }
         }
     }
     
     @Published var isMasterMuted: Bool = false {
         didSet {
-            guard !isSyncingInternally else { return }
-            isSyncingInternally = true
-            syncSystemMute(muted: isMasterMuted)
-            
-            if isMasterMuted {
-                if masterVolume > 0.001 { preMuteVolume = masterVolume }
-                masterVolume = 0.0
-                syncSystemVolume(to: 0.0)
-            } else {
-                if masterVolume <= 0.001 {
-                    masterVolume = preMuteVolume > 0.001 ? preMuteVolume : 0.5
-                    syncSystemVolume(to: masterVolume)
-                }
-            }
-            isSyncingInternally = false
+            if !isSyncingHardware { setSystemMute(isMuted: isMasterMuted) }
         }
     }
     
-    struct AudioDevice: Identifiable, Hashable {
-        let id: UInt32
-        let name: String
-    }
+    private var selectedOutputDeviceID: AudioObjectID = 0
+    private var isSyncingHardware = false
     
-    @Published var outputDevices: [AudioDevice] = [
-        AudioDevice(id: 0, name: "System Default")
-    ]
-    
-    @Published var selectedOutputDeviceID: UInt32 = 0 {
-        didSet {
-            if selectedOutputDeviceID != 0 && selectedOutputDeviceID != oldValue {
-                setDefaultOutputDevice(deviceID: selectedOutputDeviceID)
-            }
-        }
-    }
+    private var controlsByPID: [Int32: RealtimeControl] = [:]
+    private var cancellables = Set<AnyCancellable>()
+    private var pollingTask: Task<Void, Never>?
 
+    // MARK: - Initialization
     init() {
-        // 1. Immediately delete any crashed/ghost aggregate devices before starting!
-        cleanupOrphanedDevices()
+        self.selectedOutputDeviceID = getDefaultOutputDeviceID()
+        
+        self.isSyncingHardware = true
+        self.masterVolume = getSystemVolume(for: self.selectedOutputDeviceID)
+        self.isMasterMuted = getSystemMute(for: self.selectedOutputDeviceID)
+        self.isSyncingHardware = false
         
         refreshRunningApps()
         
-        self.isSyncingInternally = true
-        self.masterVolume = getCurrentSystemVolume()
-        self.isMasterMuted = getCurrentSystemMute()
-        self.isSyncingInternally = false
+        if !CGPreflightScreenCaptureAccess() {
+            CGRequestScreenCaptureAccess()
+        }
         
-        if !CGPreflightScreenCaptureAccess() { CGRequestScreenCaptureAccess() }
         let audioStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-        if audioStatus == .notDetermined { AVCaptureDevice.requestAccess(for: .audio) { _ in } }
-        
-        fetchOutputDevices()
-        setupSystemAudioListeners()
+        if audioStatus == .notDetermined {
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                if !granted { print("Microphone permission denied!") }
+            }
+        } else if audioStatus == .denied || audioStatus == .restricted {
+            statusMessage = "Microphone permission is blocked in System Settings."
+        }
         
         autoHookExistingMediaApps()
         setupAutoHookingObserver()
         
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            self?.updateMeters()
+        // Start the master async loop
+        startPolling()
+    }
+    
+    // MARK: - Bulletproof Polling Loop
+    private func startPolling() {
+        pollingTask?.cancel()
+        pollingTask = Task { @MainActor in
+            while !Task.isCancelled {
+                self.updateHardwareAndMeters()
+                // Sleep for ~33ms (approx 30 frames per second)
+                try? await Task.sleep(nanoseconds: 33_333_333)
+            }
         }
     }
     
-    private func updateMeters() {
+    private func updateHardwareAndMeters() {
+        // 1. Verify we are targeting the actual physical output device right now
+        let currentDevice = getDefaultOutputDeviceID()
+        if currentDevice != selectedOutputDeviceID {
+            self.selectedOutputDeviceID = currentDevice
+            handleDeviceChange()
+        }
+        
+        // 2. Check the hardware for keyboard button presses!
+        if selectedOutputDeviceID != 0 {
+            let currentVol = getSystemVolume(for: selectedOutputDeviceID)
+            if abs(masterVolume - currentVol) > 0.01 {
+                isSyncingHardware = true
+                masterVolume = currentVol
+                isSyncingHardware = false
+            }
+            
+            let currentMute = getSystemMute(for: selectedOutputDeviceID)
+            if isMasterMuted != currentMute {
+                isSyncingHardware = true
+                isMasterMuted = currentMute
+                isSyncingHardware = false
+            }
+        }
+        
+        // 3. Update the VU meters for the UI
         for i in 0..<targets.count {
             let pid = targets[i].pid
-            if let control = controlsByPID[pid] { targets[i].level = control.currentLevel }
-        }
-    }
-    
-    // MARK: - Orphan Cleanup
-    private func cleanupOrphanedDevices() {
-        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var dataSize: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize) == noErr else { return }
-        
-        let deviceCount = Int(dataSize) / MemoryLayout<AudioObjectID>.size
-        var deviceIDs = [AudioObjectID](repeating: 0, count: deviceCount)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize, &deviceIDs) == noErr else { return }
-        
-        for deviceID in deviceIDs {
-            if let name = getDeviceName(deviceID: deviceID), name.hasPrefix("VMixer-") {
-                print("Destroying orphaned aggregate device: \(name)")
-                AudioHardwareDestroyAggregateDevice(deviceID)
+            if let control = controlsByPID[pid] {
+                targets[i].level = control.currentLevel
             }
         }
     }
@@ -217,12 +203,19 @@ final class AudioEngine: ObservableObject {
     private func autoHookExistingMediaApps() {
         let mediaAppBundles: Set<String> = [
             "com.spotify.client", "com.apple.Music", "com.apple.Safari",
-            "com.google.Chrome", "org.mozilla.firefox", "com.apple.FaceTime"
+            "com.google.Chrome", "org.mozilla.firefox", "com.microsoft.edgemac", "com.apple.TV"
         ]
         
         for app in NSWorkspace.shared.runningApplications {
-            guard let bundleID = app.bundleIdentifier, mediaAppBundles.contains(bundleID), app.processIdentifier > 0 else { continue }
-            let runningApp = RunningApp(pid: app.processIdentifier, name: app.localizedName ?? bundleID, bundleID: bundleID)
+            guard let bundleID = app.bundleIdentifier,
+                  mediaAppBundles.contains(bundleID),
+                  app.processIdentifier > 0 else { continue }
+            
+            let runningApp = RunningApp(
+                pid: app.processIdentifier,
+                name: app.localizedName ?? bundleID,
+                bundleID: bundleID
+            )
             addTarget(app: runningApp)
         }
     }
@@ -236,15 +229,21 @@ final class AudioEngine: ObservableObject {
                       app.activationPolicy == .regular,
                       app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
                 
-                guard UserDefaults.standard.bool(forKey: "autoHookEnabled") else { return }
+                let defaults = UserDefaults.standard
+                let autoHookEnabled = defaults.object(forKey: "autoHookEnabled") as? Bool ?? true
+                guard autoHookEnabled else { return }
                 
-                let ignoredString = UserDefaults.standard.string(forKey: "ignoredBundleIDs") ?? "com.apple.finder"
+                let ignoredString = defaults.string(forKey: "ignoredBundleIDs") ?? "com.apple.finder"
                 let ignoredBundleIDs = Set(ignoredString.split(separator: ",").map(String.init))
                 
                 if let bundleID = app.bundleIdentifier, ignoredBundleIDs.contains(bundleID) { return }
                 if self.targets.contains(where: { $0.pid == app.processIdentifier }) { return }
                 
-                let runningApp = RunningApp(pid: app.processIdentifier, name: app.localizedName ?? app.bundleIdentifier ?? "Unknown", bundleID: app.bundleIdentifier)
+                let runningApp = RunningApp(
+                    pid: app.processIdentifier,
+                    name: app.localizedName ?? app.bundleIdentifier ?? "Unknown",
+                    bundleID: app.bundleIdentifier
+                )
                 self.addTarget(app: runningApp)
             }
             .store(in: &cancellables)
@@ -253,14 +252,26 @@ final class AudioEngine: ObservableObject {
     // MARK: - App Tracking & Setup
     func refreshRunningApps() {
         let apps = NSWorkspace.shared.runningApplications
-            .filter { $0.processIdentifier > 0 && !$0.isTerminated }
+            .filter { $0.processIdentifier > 0 }
+            .filter { !$0.isTerminated }
             .compactMap { app -> RunningApp? in
                 let pid = Int32(app.processIdentifier)
-                guard pid > 0, pid != Int32(ProcessInfo.processInfo.processIdentifier) else { return nil }
-                let name = app.localizedName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? app.bundleIdentifier ?? "PID \(pid)"
-                return RunningApp(pid: pid, name: name, bundleID: app.bundleIdentifier)
+                guard pid > 0 else { return nil }
+                if pid == Int32(ProcessInfo.processInfo.processIdentifier) {
+                    return nil
+                }
+
+                let localizedName = app.localizedName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let fallbackName = app.bundleIdentifier ?? "PID \(pid)"
+                let safeName = localizedName.isEmpty ? fallbackName : localizedName
+                return RunningApp(pid: pid, name: safeName, bundleID: app.bundleIdentifier)
             }
+            .reduce(into: [Int32: RunningApp]()) { acc, app in
+                acc[app.pid] = app
+            }
+            .map(\.value)
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
         runningApps = apps
     }
 
@@ -268,15 +279,17 @@ final class AudioEngine: ObservableObject {
         addTarget(pid: pid, name: name, bundleID: nil)
     }
 
-    private func addTarget(pid: Int32, name: String?, bundleID: String?) {
-        guard pid > 0, !targets.contains(where: { $0.pid == pid }) else { return }
+    func addTarget(pid: Int32, name: String?, bundleID: String?) {
+        guard pid > 0 else { return }
+        if targets.contains(where: { $0.pid == pid }) { return }
 
-        guard let tapResult = createTapWithFallback(pid: pid, bundleID: bundleID) else { return }
+        guard let tapResult = createTapWithFallback(pid: pid, bundleID: bundleID) else {
+            return
+        }
         let tapID = tapResult.tapID
         guard tapID != kAudioObjectUnknown, tapID != 0 else { return }
 
-        // NEW: Apply the Software Pre-Amp if the tap was forced into a quiet Mixdown
-        let control = RealtimeControl(volumeCompensation: tapResult.volumeCompensation)
+        let control = RealtimeControl(volumeCompensation: tapResult.usedBundleFallback ? 1.0 : 1.0)
         
         guard let aggregateDeviceID = createAggregateDevice(tapID: tapID) else {
             _ = AudioHardwareDestroyProcessTap(tapID)
@@ -289,10 +302,28 @@ final class AudioEngine: ObservableObject {
         }
 
         controlsByPID[pid] = control
-        let displayName = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "PID \(pid)" : name!
-        let appIcon = NSRunningApplication(processIdentifier: pid)?.icon
+        let normalizedName = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = normalizedName.isEmpty ? "PID \(pid)" : normalizedName
+        
+        var appIcon: NSImage?
+        if let app = NSRunningApplication(processIdentifier: pid) {
+            appIcon = app.icon
+        }
 
-        let target = Target(id: pid, pid: pid, displayName: displayName, tapID: tapID, aggregateDeviceID: aggregateDeviceID, ioProcID: ioProcID, volume: 1.0, isMuted: false, icon: appIcon)
+        let target = Target(
+            id: pid,
+            pid: pid,
+            displayName: displayName,
+            bundleID: bundleID,
+            tapID: tapID,
+            aggregateDeviceID: aggregateDeviceID,
+            ioProcID: ioProcID,
+            volume: 1.0,
+            isMuted: false,
+            level: 0.0,
+            icon: appIcon
+        )
+        
         targets.append(target)
         statusMessage = "Auto-Hooked \(target.displayName)"
     }
@@ -302,7 +333,7 @@ final class AudioEngine: ObservableObject {
     }
 
     // MARK: - CoreAudio Integration
-    private func createTapWithFallback(pid: Int32, bundleID: String?) -> (tapID: AudioObjectID, volumeCompensation: Float)? {
+    private func createTapWithFallback(pid: Int32, bundleID: String?) -> (tapID: AudioObjectID, usedBundleFallback: Bool)? {
         
         if let bundleID, !bundleID.isEmpty {
             var bundleTapID: AudioObjectID = 0
@@ -310,45 +341,36 @@ final class AudioEngine: ObservableObject {
             bundleDescription.uuid = UUID()
             
             var bundlesToTap = [bundleID]
-            var compensation: Float = 1.0
             switch bundleID {
             case "com.apple.Safari", "com.apple.SafariTechnologyPreview":
                 bundlesToTap.append("com.apple.WebKit.WebContent")
                 bundlesToTap.append("com.apple.WebKit.GPU")
-                compensation = 1.25
-                
             case "com.google.Chrome", "com.brave.Browser", "com.microsoft.edgemac", "com.vivaldi.Vivaldi":
                 bundlesToTap.append("\(bundleID).helper")
                 bundlesToTap.append("\(bundleID).helper.renderer")
                 bundlesToTap.append("\(bundleID).helper.plugin")
-                compensation = 2.0
-                
             case "org.mozilla.firefox":
                 bundlesToTap.append("org.mozilla.plugincontainer")
-                compensation = 2.0
-                
-            case "com.apple.FaceTime":
-                bundlesToTap = ["com.apple.avconferenced"]
-                bundlesToTap.append("com.apple.telephonyutilities.callservicesd")
-                compensation = 3.0
-                
-            default: break
+            default:
+                break
             }
             
-           
-            let needsMixdown = bundlesToTap.count > 1
-            
             bundleDescription.bundleIDs = bundlesToTap
-            bundleDescription.isMixdown = needsMixdown
+            bundleDescription.isMixdown = true
             bundleDescription.isMono = false
             bundleDescription.name = "VMixerTap-\(pid)"
             bundleDescription.isPrivate = false
             bundleDescription.muteBehavior = .mutedWhenTapped
 
-            if AudioHardwareCreateProcessTap(bundleDescription, &bundleTapID) == noErr {
-                let recoveredTapID = normalizedTapID(bundleTapID, fallbackUID: bundleDescription.uuid.uuidString, expectedName: bundleDescription.name)
+            let bundleStatus = AudioHardwareCreateProcessTap(bundleDescription, &bundleTapID)
+            if bundleStatus == noErr {
+                let recoveredTapID = normalizedTapID(
+                    bundleTapID,
+                    fallbackUID: bundleDescription.uuid.uuidString,
+                    expectedName: bundleDescription.name
+                )
                 if recoveredTapID != kAudioObjectUnknown, recoveredTapID != 0 {
-                    return (recoveredTapID, needsMixdown ? compensation:1.0)
+                    return (recoveredTapID, true)
                 }
                 statusMessage = "Tap was created but UID lookup failed."
                 return nil
@@ -363,60 +385,100 @@ final class AudioEngine: ObservableObject {
             pidDescription.isPrivate = false
             pidDescription.muteBehavior = .mutedWhenTapped
 
-            if AudioHardwareCreateProcessTap(pidDescription, &pidTapID) == noErr {
-                let recoveredTapID = normalizedTapID(pidTapID, fallbackUID: pidDescription.uuid.uuidString, expectedName: pidDescription.name)
+            let pidStatus = AudioHardwareCreateProcessTap(pidDescription, &pidTapID)
+            if pidStatus == noErr {
+                let recoveredTapID = normalizedTapID(
+                    pidTapID,
+                    fallbackUID: pidDescription.uuid.uuidString,
+                    expectedName: pidDescription.name
+                )
                 if recoveredTapID != kAudioObjectUnknown, recoveredTapID != 0 {
-                    // Tap by PID forces a stereoMixdown, so it requires the volume boost
-                    return (recoveredTapID, 2.0)
+                    return (recoveredTapID, false)
                 }
+                statusMessage = "Tap was created but UID lookup failed."
                 return nil
             }
+            statusMessage = "Could not hook PID \(pid)."
             return nil
         }
 
-        statusMessage = "PID \(pid) cannot be tapped."
+        statusMessage = "PID \(pid) cannot be tapped by PID."
         return nil
     }
 
     private func normalizedTapID(_ tapID: AudioObjectID, fallbackUID: String, expectedName: String) -> AudioObjectID {
-        if tapID != 0, tapID != kAudioObjectUnknown { return tapID }
-        if let translated = translateTapUIDToObjectID(uid: fallbackUID) { return translated }
-        if let listed = findTapFromTapList(expectedUID: fallbackUID, expectedName: expectedName) { return listed }
+        if tapID != 0, tapID != kAudioObjectUnknown {
+            return tapID
+        }
+        if let translated = translateTapUIDToObjectID(uid: fallbackUID) {
+            return translated
+        }
+        if let listed = findTapFromTapList(expectedUID: fallbackUID, expectedName: expectedName) {
+            return listed
+        }
         return 0
     }
 
     private func translateTapUIDToObjectID(uid: String) -> AudioObjectID? {
-        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslateUIDToTap, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslateUIDToTap,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
         var uidValue: CFString = uid as CFString
         var tapID: AudioObjectID = 0
         var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, UInt32(MemoryLayout<CFString>.size), &uidValue, &size, &tapID)
+
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            UInt32(MemoryLayout<CFString>.size),
+            &uidValue,
+            &size,
+            &tapID
+        )
+
         guard status == noErr, tapID != 0, tapID != kAudioObjectUnknown else { return nil }
         return tapID
     }
 
     private func findTapFromTapList(expectedUID: String, expectedName: String) -> AudioObjectID? {
-        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTapList, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTapList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
         var dataSize: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize) == noErr, dataSize >= UInt32(MemoryLayout<AudioObjectID>.size) else { return nil }
+        let sizeStatus = AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize)
+        guard sizeStatus == noErr, dataSize >= UInt32(MemoryLayout<AudioObjectID>.size) else { return nil }
 
         let count = Int(dataSize) / MemoryLayout<AudioObjectID>.size
         var taps = Array(repeating: AudioObjectID(0), count: count)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize, &taps) == noErr else { return nil }
+        let dataStatus = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize, &taps)
+        guard dataStatus == noErr else { return nil }
 
         for tap in taps.reversed() {
             guard tap != 0, tap != kAudioObjectUnknown else { continue }
-            if tapUID(for: tap) == expectedUID || objectName(for: tap) == expectedName { return tap }
+            let uid = tapUID(for: tap)
+            let name = objectName(for: tap)
+            if uid == expectedUID || name == expectedName {
+                return tap
+            }
         }
         return nil
     }
 
     private func objectName(for objectID: AudioObjectID) -> String? {
-        var address = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
         var cfName: CFString?
         var size = UInt32(MemoryLayout<CFString?>.size)
-        guard AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &cfName) == noErr, let name = cfName else { return nil }
-        return name as String
+        let status = AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &cfName)
+        guard status == noErr, let cfName else { return nil }
+        return cfName as String
     }
 
     // MARK: - App Controls
@@ -429,15 +491,21 @@ final class AudioEngine: ObservableObject {
             _ = AudioDeviceDestroyIOProcID(target.aggregateDeviceID, ioProcID)
         }
         _ = AudioHardwareDestroyAggregateDevice(target.aggregateDeviceID)
-        _ = AudioHardwareDestroyProcessTap(target.tapID)
+
+        let status = AudioHardwareDestroyProcessTap(target.tapID)
         controlsByPID[pid] = nil
+
         targets.remove(at: index)
+        if status == noErr {
+            statusMessage = "Removed \(target.displayName)."
+        }
     }
 
     func setMuted(pid: Int32, muted: Bool) {
         guard let index = targets.firstIndex(where: { $0.pid == pid }) else { return }
         targets[index].isMuted = muted
         controlsByPID[pid]?.set(muted: muted)
+        statusMessage = muted ? "Muted \(targets[index].displayName)." : "Unmuted \(targets[index].displayName)."
     }
 
     func setVolume(pid: Int32, volume: Float) {
@@ -454,6 +522,8 @@ final class AudioEngine: ObservableObject {
 
             let inBuffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
             let outBuffers = UnsafeMutableAudioBufferListPointer(outOutputData)
+            
+            var maxLevel: Float = 0.0
 
             for bufferIndex in 0..<min(inBuffers.count, outBuffers.count) {
                 let input = inBuffers[bufferIndex]
@@ -463,43 +533,54 @@ final class AudioEngine: ObservableObject {
                 guard let src = input.mData, let dst = output.mData, byteCount > 0 else { continue }
                 dst.copyMemory(from: src, byteCount: Int(byteCount))
 
-                let sampleCount = Int(byteCount) / MemoryLayout<Float>.size
-                if sampleCount > 0 {
-                    control.add(frames: UInt32(sampleCount / 2))
-                    let floatPointer = dst.assumingMemoryBound(to: Float.self)
-                    
-                    var rms: Float = 0.0
-                    vDSP_rmsqv(floatPointer, 1, &rms, vDSP_Length(sampleCount))
-                    
-                    let db = 20 * log10(max(rms, 0.001))
-                    let normalizedLevel = max(0.0, min(1.0, (db + 60) / 60))
-                    control.set(level: Float(normalizedLevel))
-                    
-                    // Applies normal volume *PLUS* the Software Pre-Amp if needed
-                    var localGain = gain
-                    if localGain != 1.0 {
-                        vDSP_vsmul(floatPointer, 1, &localGain, floatPointer, 1, vDSP_Length(sampleCount))
-                    }
+                let frameCount = Int(byteCount) / MemoryLayout<Float>.size
+                if frameCount > 0 {
+                    control.add(frames: UInt32(frameCount))
                 }
                 
+                let floatPointer = dst.bindMemory(to: Float.self, capacity: frameCount)
+                
+                var rms: Float = 0.0
+                vDSP_rmsqv(floatPointer, 1, &rms, vDSP_Length(frameCount))
+                let db = 20 * log10(max(rms, 0.001))
+                let normalizedLevel = max(0.0, min(1.0, (db + 60) / 60))
+                maxLevel = max(maxLevel, Float(normalizedLevel))
+                
+                if gain != 1.0 {
+                    var mutableGain = gain
+                    vDSP_vsmul(floatPointer, 1, &mutableGain, floatPointer, 1, vDSP_Length(frameCount))
+                }
                 output.mDataByteSize = byteCount
                 outBuffers[bufferIndex] = output
             }
+            
+            control.set(level: maxLevel)
         }
 
-        if status == noErr, let ioProcID {
-            _ = AudioDeviceStart(deviceID, ioProcID)
-            return ioProcID
+        guard status == noErr, let ioProcID else { return nil }
+
+        let startStatus = AudioDeviceStart(deviceID, ioProcID)
+        guard startStatus == noErr else {
+            _ = AudioDeviceDestroyIOProcID(deviceID, ioProcID)
+            return nil
         }
-        return nil
+
+        return ioProcID
     }
 
     private func createAggregateDevice(tapID: AudioObjectID) -> AudioObjectID? {
         let uid = "Rohan.VMixer.Aggregate.\(UUID().uuidString)"
-        guard let tapUID = tapUID(for: tapID), let outputDeviceUID = defaultOutputDeviceUID() else { return nil }
+        guard let tapUID = tapUID(for: tapID) else { return nil }
+        guard let outputDeviceUID = defaultOutputDeviceUID() else { return nil }
 
-        let tapEntry: [String: Any] = [kAudioSubTapUIDKey: tapUID, kAudioSubTapDriftCompensationKey: true]
-        let outputSubdeviceEntry: [String: Any] = [kAudioSubDeviceUIDKey: outputDeviceUID, kAudioSubDeviceDriftCompensationKey: true]
+        let tapEntry: [String: Any] = [
+            kAudioSubTapUIDKey: tapUID,
+            kAudioSubTapDriftCompensationKey: true
+        ]
+
+        let outputSubdeviceEntry: [String: Any] = [
+            kAudioSubDeviceUIDKey: outputDeviceUID
+        ]
 
         let aggregateDescription: [String: Any] = [
             kAudioAggregateDeviceNameKey: "VMixer-\(tapUID.prefix(6))",
@@ -512,223 +593,192 @@ final class AudioEngine: ObservableObject {
         ]
 
         var deviceID: AudioObjectID = 0
-        if AudioHardwareCreateAggregateDevice(aggregateDescription as CFDictionary, &deviceID) == noErr, deviceID != 0 {
-            return deviceID
-        }
-        return nil
+        let status = AudioHardwareCreateAggregateDevice(aggregateDescription as CFDictionary, &deviceID)
+        guard status == noErr, deviceID != kAudioObjectUnknown, deviceID != 0 else { return nil }
+        return deviceID
     }
 
     private func tapUID(for tapID: AudioObjectID) -> String? {
-        var address = AudioObjectPropertyAddress(mSelector: kAudioTapPropertyUID, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
         var cfUID: CFString?
         var size = UInt32(MemoryLayout<CFString?>.size)
-        guard AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &cfUID) == noErr, let uid = cfUID else { return nil }
-        return uid as String
+        let status = AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &cfUID)
+        guard status == noErr, let cfUID else { return nil }
+        return cfUID as String
     }
 
     private func defaultOutputDeviceUID() -> String? {
-        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var deviceID: AudioObjectID = 0
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID) == noErr, deviceID != kAudioObjectUnknown else { return nil }
+        let deviceID = getDefaultOutputDeviceID()
+        guard deviceID != 0 else { return nil }
 
-        var uidAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var uidAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
         var cfUID: CFString?
         var uidSize = UInt32(MemoryLayout<CFString?>.size)
-        guard AudioObjectGetPropertyData(deviceID, &uidAddress, 0, nil, &uidSize, &cfUID) == noErr, let uid = cfUID else { return nil }
-        return uid as String
+        let uidStatus = AudioObjectGetPropertyData(deviceID, &uidAddress, 0, nil, &uidSize, &cfUID)
+        guard uidStatus == noErr, let cfUID else { return nil }
+        return cfUID as String
     }
 
     private func translatePIDToProcessObjectID(pid: Int32) -> AudioObjectID? {
-        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
         var pidValue = pid
         var objectID: AudioObjectID = 0
         var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, UInt32(MemoryLayout<Int32>.size), &pidValue, &size, &objectID) == noErr, objectID != kAudioObjectUnknown else { return nil }
+
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            UInt32(MemoryLayout<Int32>.size),
+            &pidValue,
+            &size,
+            &objectID
+        )
+
+        guard status == noErr, objectID != kAudioObjectUnknown else { return nil }
         return objectID
     }
     
-    // MARK: - Hardware Device Management
-    func fetchOutputDevices() {
-        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var dataSize: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize) == noErr else { return }
+    // MARK: - Master Output Getters/Setters
+    private func getSystemVolume(for deviceID: AudioObjectID) -> Float {
+        var volume: Float = 0.0
+        var dataSize = UInt32(MemoryLayout<Float>.size)
         
-        let deviceCount = Int(dataSize) / MemoryLayout<AudioObjectID>.size
-        var deviceIDs = [AudioObjectID](repeating: 0, count: deviceCount)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize, &deviceIDs) == noErr else { return }
-        
-        var newDevices: [AudioDevice] = []
-        for deviceID in deviceIDs {
-            if hasOutputChannels(deviceID: deviceID), let name = getDeviceName(deviceID: deviceID) {
-                newDevices.append(AudioDevice(id: deviceID, name: name))
-            }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        if AudioHardwareServiceGetPropertyData(deviceID, &address, 0, nil, &dataSize, &volume) == noErr {
+            return volume
         }
         
-        DispatchQueue.main.async {
-            self.outputDevices = newDevices
-            self.selectedOutputDeviceID = self.getDefaultOutputDevice()
+        // Fallback 1: Raw Main Hardware Slider
+        address.mSelector = kAudioDevicePropertyVolumeScalar
+        if AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, &volume) == noErr {
+            return volume
         }
-    }
-    
-    private func hasOutputChannels(deviceID: AudioObjectID) -> Bool {
-        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
-        var dataSize: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, nil, &dataSize) == noErr else { return false }
-        let bufferList = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: Int(dataSize))
-        defer { bufferList.deallocate() }
-        guard AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, bufferList) == noErr else { return false }
-        for buffer in UnsafeMutableAudioBufferListPointer(bufferList) {
-            if buffer.mNumberChannels > 0 { return true }
+        
+        // Fallback 2: Raw Channel 1 Slider (MacBook built-in speakers)
+        address.mElement = 1
+        if AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, &volume) == noErr {
+            return volume
         }
-        return false
+        
+        return 0.0
     }
     
-    private func getDeviceName(deviceID: AudioObjectID) -> String? {
-        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var name: CFString?
-        var dataSize = UInt32(MemoryLayout<CFString?>.size)
-        guard AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, &name) == noErr, let deviceName = name as String? else { return nil }
-        return deviceName
+    private func getSystemMute(for deviceID: AudioObjectID) -> Bool {
+        var mutedInt: UInt32 = 0
+        var dataSize = UInt32(MemoryLayout<UInt32>.size)
+        
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        
+        if AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, &mutedInt) == noErr {
+            return mutedInt == 1
+        }
+        
+        address.mElement = 1
+        if AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, &mutedInt) == noErr {
+            return mutedInt == 1
+        }
+        
+        // Software Fallback
+        return getSystemVolume(for: deviceID) <= 0.001
     }
     
-    private func getDefaultOutputDevice() -> AudioObjectID {
-        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    private func getDefaultOutputDeviceID() -> AudioObjectID {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
         var deviceID: AudioObjectID = 0
-        var dataSize = UInt32(MemoryLayout<AudioObjectID>.size)
-        return AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize, &deviceID) == noErr ? deviceID : 0
-    }
-    
-    private func setDefaultOutputDevice(deviceID: AudioObjectID) {
-        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var id = deviceID
-        AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, UInt32(MemoryLayout<AudioObjectID>.size), &id)
-    }
-    
-    // MARK: - CoreAudio Event Listeners (Hardware Keys)
-    private func setupSystemAudioListeners() {
-        var defaultOutputAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        updateListeningDevice()
-        
-        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &defaultOutputAddress, nil) { [weak self] _, _ in
-            DispatchQueue.main.async { self?.updateListeningDevice() }
-        }
-    }
-    
-    private func updateListeningDevice() {
-        let deviceID = getDefaultOutputDevice()
-        guard deviceID != 0, deviceID != currentListeningDeviceID else { return }
-        currentListeningDeviceID = deviceID
-        
-        let capturedDeviceID = deviceID
-        var volAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
-        if !AudioObjectHasProperty(deviceID, &volAddress) { volAddress.mElement = 1 }
-        
-        AudioObjectAddPropertyListenerBlock(deviceID, &volAddress, nil) { [weak self] _, _ in
-            DispatchQueue.main.async { if self?.currentListeningDeviceID == capturedDeviceID { self?.handleExternalVolumeChange() } }
-        }
-        
-        var muteAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
-        if !AudioObjectHasProperty(deviceID, &muteAddress) { muteAddress.mElement = 1 }
-        
-        AudioObjectAddPropertyListenerBlock(deviceID, &muteAddress, nil) { [weak self] _, _ in
-            DispatchQueue.main.async { if self?.currentListeningDeviceID == capturedDeviceID { self?.handleExternalMuteChange() } }
-        }
-    }
-    
-    private func handleExternalVolumeChange() {
-        guard !isSyncingInternally else { return }
-        let newVol = getCurrentSystemVolume()
-        if abs(masterVolume - newVol) > 0.01 {
-            isSyncingInternally = true
-            masterVolume = newVol
-            if newVol <= 0.001 && !isMasterMuted { isMasterMuted = true }
-            else if newVol > 0.001 && isMasterMuted { isMasterMuted = false }
-            isSyncingInternally = false
-        }
-    }
-
-    private func handleExternalMuteChange() {
-        guard !isSyncingInternally else { return }
-        let newMute = getCurrentSystemMute()
-        if isMasterMuted != newMute {
-            isSyncingInternally = true
-            isMasterMuted = newMute
-            if newMute {
-                if masterVolume > 0.001 { preMuteVolume = masterVolume }
-                masterVolume = 0.0
-            } else {
-                if masterVolume <= 0.001 { masterVolume = preMuteVolume > 0.001 ? preMuteVolume : 0.5 }
-            }
-            isSyncingInternally = false
-        }
-    }
-    
-    // MARK: - CoreAudio Volume Output Writers
-    private func syncSystemVolume(to value: Float) {
-        var deviceID = AudioObjectID(0)
         var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID) == noErr else { return }
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID)
+        return deviceID
+    }
+    
+    func setSystemVolume(to value: Float) {
+        let deviceID = selectedOutputDeviceID
+        guard deviceID != 0 else { return }
         
         var volume = value
-        let volSize = UInt32(MemoryLayout<Float>.size)
-        var volAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
+        let dataSize = UInt32(MemoryLayout<Float>.size)
         
-        if AudioObjectHasProperty(deviceID, &volAddress) {
-            AudioObjectSetPropertyData(deviceID, &volAddress, 0, nil, volSize, &volume)
-        } else {
-            for channel: UInt32 in 1...2 {
-                volAddress.mElement = channel
-                if AudioObjectHasProperty(deviceID, &volAddress) { AudioObjectSetPropertyData(deviceID, &volAddress, 0, nil, volSize, &volume) }
+        // Try Virtual Service First
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        if AudioHardwareServiceSetPropertyData(deviceID, &address, 0, nil, dataSize, &volume) == noErr { return }
+        
+        // Try Raw Hardware Next
+        address.mSelector = kAudioDevicePropertyVolumeScalar
+        if AudioObjectSetPropertyData(deviceID, &address, 0, nil, dataSize, &volume) == noErr { return }
+        
+        // Split L/R channels for stuboorn hardware
+        address.mElement = 1
+        AudioObjectSetPropertyData(deviceID, &address, 0, nil, dataSize, &volume)
+        address.mElement = 2
+        AudioObjectSetPropertyData(deviceID, &address, 0, nil, dataSize, &volume)
+    }
+    
+    func setSystemMute(isMuted: Bool) {
+        let deviceID = selectedOutputDeviceID
+        guard deviceID != 0 else { return }
+
+        var mutedInt: UInt32 = isMuted ? 1 : 0
+        let dataSize = UInt32(MemoryLayout<UInt32>.size)
+        
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        if AudioObjectSetPropertyData(deviceID, &address, 0, nil, dataSize, &mutedInt) == noErr { return }
+        
+        address.mElement = 1
+        let lStatus = AudioObjectSetPropertyData(deviceID, &address, 0, nil, dataSize, &mutedInt)
+        address.mElement = 2
+        let rStatus = AudioObjectSetPropertyData(deviceID, &address, 0, nil, dataSize, &mutedInt)
+        
+        if lStatus == noErr || rStatus == noErr { return }
+        
+        setSystemVolume(to: isMuted ? 0.0 : masterVolume)
+    }
+    
+    private func handleDeviceChange() {
+        print("Output device changed! Re-routing audio...")
+        
+        let activeApps = targets.map { (pid: $0.pid, name: $0.displayName, bundleID: $0.bundleID) }
+        
+        for app in activeApps {
+            removeTarget(pid: app.pid)
+        }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            for app in activeApps {
+                self?.addTarget(pid: app.pid, name: app.name, bundleID: app.bundleID)
             }
         }
-    }
-    
-    private func getCurrentSystemVolume() -> Float {
-        var deviceID = AudioObjectID(0)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID) == noErr else { return 0.5 }
-        
-        var volume: Float = 0.5
-        var volAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
-        if !AudioObjectHasProperty(deviceID, &volAddress) { volAddress.mElement = 1 }
-        if AudioObjectHasProperty(deviceID, &volAddress) { AudioObjectGetPropertyData(deviceID, &volAddress, 0, nil, &size, &volume) }
-        return volume
-    }
-    
-    private func syncSystemMute(muted: Bool) {
-        var deviceID = AudioObjectID(0)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID) == noErr else { return }
-        
-        var muteValue: UInt32 = muted ? 1 : 0
-        let muteSize = UInt32(MemoryLayout<UInt32>.size)
-        var muteAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
-        
-        if AudioObjectHasProperty(deviceID, &muteAddress) {
-            AudioObjectSetPropertyData(deviceID, &muteAddress, 0, nil, muteSize, &muteValue)
-        } else {
-            for channel: UInt32 in 1...2 {
-                muteAddress.mElement = channel
-                if AudioObjectHasProperty(deviceID, &muteAddress) { AudioObjectSetPropertyData(deviceID, &muteAddress, 0, nil, muteSize, &muteValue) }
-            }
-        }
-    }
-    
-    private func getCurrentSystemMute() -> Bool {
-        var deviceID = AudioObjectID(0)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID) == noErr else { return false }
-        
-        var muteValue: UInt32 = 0
-        var muteAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
-        if !AudioObjectHasProperty(deviceID, &muteAddress) { muteAddress.mElement = 1 }
-        if AudioObjectHasProperty(deviceID, &muteAddress) { AudioObjectGetPropertyData(deviceID, &muteAddress, 0, nil, &size, &muteValue) }
-        
-        return muteValue != 0
     }
 }
