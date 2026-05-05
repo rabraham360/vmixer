@@ -312,6 +312,7 @@ final class AudioEngine: ObservableObject {
         if let bundleID = bundleID {
             switch bundleID {
             case "com.apple.FaceTime":
+                compensation = 20
             case "com.spotify.client":
                 compensation = 1.5
             case "com.apple.Safari", "com.google.Chrome":
