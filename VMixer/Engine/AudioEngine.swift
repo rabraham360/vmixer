@@ -203,7 +203,7 @@ final class AudioEngine: ObservableObject {
     private func autoHookExistingMediaApps() {
         let mediaAppBundles: Set<String> = [
             "com.spotify.client", "com.apple.Music", "com.apple.Safari",
-            "com.google.Chrome", "org.mozilla.firefox", "com.microsoft.edgemac", "com.apple.TV"
+            "com.google.Chrome", "org.mozilla.firefox", "com.microsoft.edgemac", "com.apple.TV","com.apple.FaceTime"
         ]
         
         for app in NSWorkspace.shared.runningApplications {
@@ -289,7 +289,21 @@ final class AudioEngine: ObservableObject {
         let tapID = tapResult.tapID
         guard tapID != kAudioObjectUnknown, tapID != 0 else { return }
 
-        let control = RealtimeControl(volumeCompensation: tapResult.usedBundleFallback ? 1.0 : 1.0)
+        var compensation: Float = 1.0
+                
+        if let bundleID = bundleID {
+            switch bundleID {
+            case "com.apple.FaceTime":
+                compensation = 20   // 3x boost for FaceTime
+            case "com.spotify.client":
+                compensation = 1.5   // Example: 1.5x boost for Spotify
+            case "com.apple.Safari", "com.google.Chrome":
+                compensation = 1.25   // Example: Lower browser volume to 80%
+            default:
+                compensation = 1.0   // Normal volume for everything else
+            }
+        }
+        let control = RealtimeControl(volumeCompensation: compensation)
         
         guard let aggregateDeviceID = createAggregateDevice(tapID: tapID) else {
             _ = AudioHardwareDestroyProcessTap(tapID)
@@ -351,6 +365,8 @@ final class AudioEngine: ObservableObject {
                 bundlesToTap.append("\(bundleID).helper.plugin")
             case "org.mozilla.firefox":
                 bundlesToTap.append("org.mozilla.plugincontainer")
+            case "com.apple.FaceTime":
+                bundlesToTap.append("com.apple.avconferenced")
             default:
                 break
             }
