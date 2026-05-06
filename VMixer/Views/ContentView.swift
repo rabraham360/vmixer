@@ -12,6 +12,10 @@ struct ContentView: View {
     @Environment(\.openSettings) private var openSettings
     @AppStorage("showDebugStatus") private var showDebugStatus = false
     
+    private var visibleTargets: [AudioEngine.Target]{
+        engine.targets.filter{ !$0.isHidden}
+    }
+    
     // MARK: - Window Sizing
     let maxWindowHeight: CGFloat = 600
     let baseHeight: CGFloat = 135
@@ -19,10 +23,10 @@ struct ContentView: View {
     let emptyStateHeight: CGFloat = 150
     
     var dynamicHeight: CGFloat {
-        if engine.targets.isEmpty {
+        if visibleTargets.isEmpty {
             return baseHeight + emptyStateHeight
         }
-        let contentHeight = baseHeight + (CGFloat(engine.targets.count) * rowHeight) + 24
+        let contentHeight = baseHeight + (CGFloat(visibleTargets.count) * rowHeight) + 24
         return min(contentHeight, maxWindowHeight)
     }
     
@@ -96,7 +100,7 @@ struct ContentView: View {
             Divider()
 
             // MARK: - Active Apps List
-            if engine.targets.isEmpty {
+            if visibleTargets.isEmpty {
                 VStack(spacing: 8) {
                     Spacer()
                     Image(systemName: "speaker.zzz")
@@ -111,7 +115,7 @@ struct ContentView: View {
             } else {
                 ScrollView {
                     VStack(spacing: 12) {
-                        ForEach(engine.targets) { target in
+                        ForEach(visibleTargets) { target in
                             TargetRowView(engine: engine, target: target)
                         }
                     }
@@ -136,6 +140,6 @@ struct ContentView: View {
             }
         }
         .frame(width: 340, height: dynamicHeight)
-        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: engine.targets.count)
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: visibleTargets.count)
     }
 }

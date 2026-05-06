@@ -82,6 +82,7 @@ final class AudioEngine: ObservableObject {
         var isMuted: Bool
         var level: Float = 0.0
         var icon: NSImage?
+        var isHidden: Bool = false
     }
 
     struct RunningApp: Identifiable, Hashable {
@@ -299,20 +300,29 @@ final class AudioEngine: ObservableObject {
 
     func addTarget(pid: Int32, name: String?, bundleID: String?) {
         guard pid > 0 else { return }
-        if targets.contains(where: { $0.pid == pid }) { return }
-
-        guard let tapResult = createTapWithFallback(pid: pid, bundleID: bundleID) else {
-            return
+        
+        // 1. DEDUPLICATE BY BUNDLE ID: Fixes multiple sliders from helper extensions!
+        if let bundleID = bundleID, !bundleID.isEmpty {
+            if targets.contains(where: { $0.bundleID == bundleID }) { return }
+        } else {
+            if targets.contains(where: { $0.pid == pid }) { return }
         }
+        
+        guard let tapResult = createTapWithFallback(pid: pid, bundleID: bundleID) else { return }
         let tapID = tapResult.tapID
         guard tapID != kAudioObjectUnknown, tapID != 0 else { return }
-
+        
+        // 2. SET COMPENSATIONS & HIDE THE DAEMON
         var compensation: Float = 1.0
-                
+        var isHidden = false
+        
         if let bundleID = bundleID {
             switch bundleID {
-            case "com.apple.FaceTime":
-                compensation = 20
+            case "com.apple.avconferenced": // The Voice Daemon
+                compensation = 20.0
+                isHidden = true             // Hide it from the UI!
+            case "com.apple.FaceTime":      // The UI / Ringtone
+                compensation = 1.0
             case "com.spotify.client":
                 compensation = 1.5
             case "com.apple.Safari", "com.google.Chrome":
@@ -332,7 +342,7 @@ final class AudioEngine: ObservableObject {
             _ = AudioHardwareDestroyProcessTap(tapID)
             return
         }
-
+        
         controlsByPID[pid] = control
         let normalizedName = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let displayName = normalizedName.isEmpty ? "PID \(pid)" : normalizedName
@@ -341,23 +351,22 @@ final class AudioEngine: ObservableObject {
         if let app = NSRunningApplication(processIdentifier: pid) {
             appIcon = app.icon
         }
-
+        
         let target = Target(
-            id: pid,
-            pid: pid,
-            displayName: displayName,
-            bundleID: bundleID,
-            tapID: tapID,
-            aggregateDeviceID: aggregateDeviceID,
-            ioProcID: ioProcID,
-            volume: 1.0,
-            isMuted: false,
-            level: 0.0,
-            icon: appIcon
+            id: pid, pid: pid, displayName: displayName, bundleID: bundleID,
+            tapID: tapID, aggregateDeviceID: aggregateDeviceID, ioProcID: ioProcID,
+            volume: 1.0, isMuted: false, level: 0.0, icon: appIcon,
+            isHidden: isHidden // Apply the hidden status
         )
         
         targets.append(target)
         statusMessage = "Auto-Hooked \(target.displayName)"
+        
+        // 3. AUTO-HOOK DAEMON: If we just hooked FaceTime, secretly hook its daemon in the background
+        if bundleID == "com.apple.FaceTime" {
+            // CoreAudio only needs the Bundle ID to tap, so we use a dummy PID to bypass the pid > 0 guard
+            addTarget(pid: pid + 100000, name: "FaceTime Voice", bundleID: "com.apple.avconferenced")
+        }
     }
 
     func addTarget(app: RunningApp) {
@@ -383,8 +392,6 @@ final class AudioEngine: ObservableObject {
                 bundlesToTap.append("\(bundleID).helper.plugin")
             case "org.mozilla.firefox":
                 bundlesToTap.append("org.mozilla.plugincontainer")
-            case "com.apple.FaceTime":
-                bundlesToTap.append("com.apple.avconferenced")
             default:
                 break
             }
@@ -519,19 +526,26 @@ final class AudioEngine: ObservableObject {
     func removeTarget(pid: Int32) {
         guard let index = targets.firstIndex(where: { $0.pid == pid }) else { return }
         let target = targets[index]
-
+        
         if let ioProcID = target.ioProcID {
             _ = AudioDeviceStop(target.aggregateDeviceID, ioProcID)
             _ = AudioDeviceDestroyIOProcID(target.aggregateDeviceID, ioProcID)
         }
         _ = AudioHardwareDestroyAggregateDevice(target.aggregateDeviceID)
-
+        
         let status = AudioHardwareDestroyProcessTap(target.tapID)
         controlsByPID[pid] = nil
-
+        
         targets.remove(at: index)
         if status == noErr {
             statusMessage = "Removed \(target.displayName)."
+        }
+        
+        // Link: If FaceTime is closed, automatically destroy the hidden daemon tap too
+        if target.bundleID == "com.apple.FaceTime" {
+            if let daemonTarget = targets.first(where: { $0.bundleID == "com.apple.avconferenced" }) {
+                removeTarget(pid: daemonTarget.pid)
+            }
         }
     }
 
@@ -540,6 +554,15 @@ final class AudioEngine: ObservableObject {
         targets[index].isMuted = muted
         controlsByPID[pid]?.set(muted: muted)
         statusMessage = muted ? "Muted \(targets[index].displayName)." : "Unmuted \(targets[index].displayName)."
+        
+        // Link: Mute the hidden daemon if FaceTime is muted
+        if targets[index].bundleID == "com.apple.FaceTime" {
+            if let dIndex = targets.firstIndex(where: { $0.bundleID == "com.apple.avconferenced" }) {
+                let dPID = targets[dIndex].pid
+                targets[dIndex].isMuted = muted
+                controlsByPID[dPID]?.set(muted: muted)
+            }
+        }
     }
 
     func setVolume(pid: Int32, volume: Float) {
@@ -547,6 +570,15 @@ final class AudioEngine: ObservableObject {
         let clamped = min(max(volume, 0.0), 1.0)
         targets[index].volume = clamped
         controlsByPID[pid]?.set(volume: clamped)
+        
+        // Link: Adjust the hidden daemon volume if FaceTime volume changes
+        if targets[index].bundleID == "com.apple.FaceTime" {
+            if let dIndex = targets.firstIndex(where: { $0.bundleID == "com.apple.avconferenced" }) {
+                let dPID = targets[dIndex].pid
+                targets[dIndex].volume = clamped
+                controlsByPID[dPID]?.set(volume: clamped)
+            }
+        }
     }
 
     private func startTapIO(deviceID: AudioObjectID, control: RealtimeControl) -> AudioDeviceIOProcID? {
